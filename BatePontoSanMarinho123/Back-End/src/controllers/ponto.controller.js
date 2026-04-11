@@ -90,6 +90,78 @@ async function buscarPontosHoje(funcionario_id) {
   return rows;
 }
 
+async function buscarUltimaBatidaDoFuncionario(funcionario_id) {
+  const { rows } = await pool.query(
+    `
+    SELECT id, tipo, marcado_em
+    FROM pontos
+    WHERE funcionario_id = $1
+    ORDER BY marcado_em DESC, id DESC
+    LIMIT 1
+    `,
+    [funcionario_id]
+  );
+
+  return rows[0] || null;
+}
+
+async function buscarBatidasTurnoAberto(funcionario_id) {
+  const { rows } = await pool.query(
+    `
+    SELECT id, tipo, marcado_em
+    FROM pontos
+    WHERE funcionario_id = $1
+      AND marcado_em >= (NOW() - INTERVAL '36 hours')
+    ORDER BY marcado_em ASC, id ASC
+    `,
+    [funcionario_id]
+  );
+
+  if (!rows.length) {
+    return [];
+  }
+
+  let inicioIndice = -1;
+  let saldo = 0;
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const tipo = rows[i].tipo;
+
+    if (tipo === "saida") {
+      break;
+    }
+
+    if (tipo === "entrada") {
+      inicioIndice = i;
+      saldo++;
+    } else if (tipo === "intervalo_inicio") {
+      saldo++;
+    } else if (tipo === "intervalo_fim") {
+      saldo++;
+    }
+  }
+
+  if (inicioIndice === -1) {
+    const ultima = rows[rows.length - 1];
+    if (ultima?.tipo !== "saida") {
+      return [ultima];
+    }
+    return [];
+  }
+
+  return rows.slice(inicioIndice);
+}
+
+async function buscarUltimaBatidaAberta(funcionario_id) {
+  const batidasAbertas = await buscarBatidasTurnoAberto(funcionario_id);
+
+  if (!batidasAbertas.length) {
+    return null;
+  }
+
+  return batidasAbertas[batidasAbertas.length - 1];
+}
+
 function getPermissoesPorUltimaBatida(ultimaBatida) {
   const permissoes = {
     entrada: false,
@@ -136,22 +208,21 @@ exports.statusBatidas = async (req, res) => {
   try {
     await ensureTable();
 
-    const { funcionario_id } = req.params;
+    const funcionario_id = req.params.funcionario_id || req.params.id;
 
     if (!funcionario_id) {
       return res.status(400).json({ error: "Funcionário inválido" });
     }
 
     const pontosHoje = await buscarPontosHoje(funcionario_id);
-    const ultimaBatida = pontosHoje.length
-      ? pontosHoje[pontosHoje.length - 1].tipo
-      : null;
+    const ultimaBatidaAberta = await buscarUltimaBatidaAberta(funcionario_id);
 
-    const permissoes = getPermissoesPorUltimaBatida(ultimaBatida);
+    const ultimaBatidaTipo = ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null;
+    const permissoes = getPermissoesPorUltimaBatida(ultimaBatidaTipo);
 
     return res.json({
       ok: true,
-      ultima_batida: ultimaBatida,
+      ultima_batida: ultimaBatidaTipo,
       quantidade_hoje: pontosHoje.length,
       permissoes,
     });
@@ -174,16 +245,36 @@ exports.auto = async (req, res) => {
       return res.status(400).json({ error: "Funcionário inválido" });
     }
 
-    const pontosHoje = await buscarPontosHoje(funcionario_id);
+    const batidasTurnoAberto = await buscarBatidasTurnoAberto(funcionario_id);
+    const ultimaBatidaAberta = batidasTurnoAberto.length
+      ? batidasTurnoAberto[batidasTurnoAberto.length - 1]
+      : null;
 
-    if (pontosHoje.length >= 4) {
-      return res.status(403).json({
-        error: "Você já possui 4 batidas hoje.",
-      });
+    const permissoes = getPermissoesPorUltimaBatida(
+      ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null
+    );
+
+    let tipo = null;
+
+    if (!ultimaBatidaAberta) {
+      tipo = "entrada";
+    } else if (ultimaBatidaAberta.tipo === "entrada") {
+      tipo = "saida";
+    } else if (ultimaBatidaAberta.tipo === "intervalo_inicio") {
+      tipo = "intervalo_fim";
+    } else if (ultimaBatidaAberta.tipo === "intervalo_fim") {
+      tipo = "saida";
+    } else if (ultimaBatidaAberta.tipo === "saida") {
+      tipo = "entrada";
     }
 
-    const ordem = ["entrada", "intervalo_inicio", "intervalo_fim", "saida"];
-    const tipo = ordem[pontosHoje.length];
+    if (!tipo || !permissoes[tipo]) {
+      return res.status(403).json({
+        error: "Não foi possível determinar a próxima batida automaticamente.",
+        ultima_batida: ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null,
+        permissoes,
+      });
+    }
 
     const { rows } = await pool.query(
       `
@@ -218,17 +309,15 @@ exports.bater = async (req, res) => {
       return res.status(400).json({ error: "Tipo de ponto inválido!" });
     }
 
-    const pontosHoje = await buscarPontosHoje(funcionario_id);
-    const ultimaBatida = pontosHoje.length
-      ? pontosHoje[pontosHoje.length - 1].tipo
-      : null;
+    const ultimaBatidaAberta = await buscarUltimaBatidaAberta(funcionario_id);
+    const ultimaBatidaTipo = ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null;
 
-    const permissoes = getPermissoesPorUltimaBatida(ultimaBatida);
+    const permissoes = getPermissoesPorUltimaBatida(ultimaBatidaTipo);
 
     if (!permissoes[tipo]) {
       return res.status(403).json({
         error: "Esta batida não está liberada agora.",
-        ultima_batida: ultimaBatida,
+        ultima_batida: ultimaBatidaTipo,
         permissoes,
       });
     }
