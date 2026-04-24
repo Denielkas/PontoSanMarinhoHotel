@@ -29,14 +29,10 @@ async function ensureFaltasTable() {
     );
   `);
 
-  try {
-    await pool.query(`
-      ALTER TABLE faltas_ajustes
-      ADD COLUMN IF NOT EXISTS folga BOOLEAN NOT NULL DEFAULT false
-    `);
-  } catch (err) {
-    console.log("Coluna folga já existe ou não foi necessário alterar.");
-  }
+  await pool.query(`
+    ALTER TABLE faltas_ajustes
+    ADD COLUMN IF NOT EXISTS folga BOOLEAN NOT NULL DEFAULT false
+  `);
 }
 
 /* =========================================================
@@ -48,10 +44,7 @@ function montarDataHora(dataBR, hora) {
   const [d, m, a] = String(dataBR).split("/");
   if (!d || !m || !a) return null;
 
-  return `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(
-    2,
-    "0"
-  )} ${hora}:00`;
+  return `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")} ${hora}:00`;
 }
 
 function dataBRparaISO(dataBR) {
@@ -67,10 +60,7 @@ function normalizarHora(valor) {
   if (!valor) return null;
 
   const texto = String(valor).trim();
-
-  if (texto.length >= 5) {
-    return texto.slice(0, 5);
-  }
+  if (texto.length >= 5) return texto.slice(0, 5);
 
   return null;
 }
@@ -90,21 +80,10 @@ async function buscarPontosHoje(funcionario_id) {
   return rows;
 }
 
-async function buscarUltimaBatidaDoFuncionario(funcionario_id) {
-  const { rows } = await pool.query(
-    `
-    SELECT id, tipo, marcado_em
-    FROM pontos
-    WHERE funcionario_id = $1
-    ORDER BY marcado_em DESC, id DESC
-    LIMIT 1
-    `,
-    [funcionario_id]
-  );
-
-  return rows[0] || null;
-}
-
+/* =========================================================
+   TURNO ABERTO — CORRIGIDO PARA MADRUGADA
+   Ex: entra 17:30 hoje e sai 05:30 amanhã
+========================================================= */
 async function buscarBatidasTurnoAberto(funcionario_id) {
   const { rows } = await pool.query(
     `
@@ -117,47 +96,32 @@ async function buscarBatidasTurnoAberto(funcionario_id) {
     [funcionario_id]
   );
 
-  if (!rows.length) {
-    return [];
-  }
+  if (!rows.length) return [];
 
-  let inicioIndice = -1;
-  let saldo = 0;
+  let indiceUltimaSaida = -1;
 
   for (let i = rows.length - 1; i >= 0; i--) {
-    const tipo = rows[i].tipo;
-
-    if (tipo === "saida") {
+    if (rows[i].tipo === "saida") {
+      indiceUltimaSaida = i;
       break;
     }
-
-    if (tipo === "entrada") {
-      inicioIndice = i;
-      saldo++;
-    } else if (tipo === "intervalo_inicio") {
-      saldo++;
-    } else if (tipo === "intervalo_fim") {
-      saldo++;
-    }
   }
 
-  if (inicioIndice === -1) {
-    const ultima = rows[rows.length - 1];
-    if (ultima?.tipo !== "saida") {
-      return [ultima];
-    }
-    return [];
-  }
+  const depoisDaUltimaSaida = rows.slice(indiceUltimaSaida + 1);
 
-  return rows.slice(inicioIndice);
+  const temEntradaAberta = depoisDaUltimaSaida.some(
+    (batida) => batida.tipo === "entrada"
+  );
+
+  if (!temEntradaAberta) return [];
+
+  return depoisDaUltimaSaida;
 }
 
 async function buscarUltimaBatidaAberta(funcionario_id) {
   const batidasAbertas = await buscarBatidasTurnoAberto(funcionario_id);
 
-  if (!batidasAbertas.length) {
-    return null;
-  }
+  if (!batidasAbertas.length) return null;
 
   return batidasAbertas[batidasAbertas.length - 1];
 }
@@ -233,7 +197,7 @@ exports.statusBatidas = async (req, res) => {
 };
 
 /* =========================================================
-   AUTO — reconhecimento facial simples
+   AUTO — RECONHECIMENTO FACIAL
 ========================================================= */
 exports.auto = async (req, res) => {
   try {
@@ -245,33 +209,29 @@ exports.auto = async (req, res) => {
       return res.status(400).json({ error: "Funcionário inválido" });
     }
 
-    const batidasTurnoAberto = await buscarBatidasTurnoAberto(funcionario_id);
-    const ultimaBatidaAberta = batidasTurnoAberto.length
-      ? batidasTurnoAberto[batidasTurnoAberto.length - 1]
-      : null;
+    const ultimaBatidaAberta = await buscarUltimaBatidaAberta(funcionario_id);
+    const ultimaTipo = ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null;
 
-    const permissoes = getPermissoesPorUltimaBatida(
-      ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null
-    );
+    const permissoes = getPermissoesPorUltimaBatida(ultimaTipo);
 
     let tipo = null;
 
     if (!ultimaBatidaAberta) {
       tipo = "entrada";
-    } else if (ultimaBatidaAberta.tipo === "entrada") {
+    } else if (ultimaTipo === "entrada") {
       tipo = "saida";
-    } else if (ultimaBatidaAberta.tipo === "intervalo_inicio") {
+    } else if (ultimaTipo === "intervalo_inicio") {
       tipo = "intervalo_fim";
-    } else if (ultimaBatidaAberta.tipo === "intervalo_fim") {
+    } else if (ultimaTipo === "intervalo_fim") {
       tipo = "saida";
-    } else if (ultimaBatidaAberta.tipo === "saida") {
+    } else if (ultimaTipo === "saida") {
       tipo = "entrada";
     }
 
     if (!tipo || !permissoes[tipo]) {
       return res.status(403).json({
         error: "Não foi possível determinar a próxima batida automaticamente.",
-        ultima_batida: ultimaBatidaAberta ? ultimaBatidaAberta.tipo : null,
+        ultima_batida: ultimaTipo,
         permissoes,
       });
     }
@@ -293,7 +253,7 @@ exports.auto = async (req, res) => {
 };
 
 /* =========================================================
-   BATER → usado pela tela "EscolherBatida"
+   BATER → usado pela tela EscolherBatida
 ========================================================= */
 exports.bater = async (req, res) => {
   try {
@@ -466,6 +426,7 @@ exports.ajustar = async (req, res) => {
             [idExistente, funcionario_id]
           );
         }
+
         return null;
       }
 
@@ -484,6 +445,7 @@ exports.ajustar = async (req, res) => {
           `,
           [dataHora, tipoPonto, idExistente, funcionario_id]
         );
+
         return idExistente;
       }
 
@@ -787,7 +749,7 @@ exports.buscarPorCPF = async (req, res) => {
         marcado_em
       FROM pontos
       WHERE funcionario_id = $1
-        AND marcado_em::date = CURRENT_DATE
+        AND marcado_em >= (NOW() - INTERVAL '36 hours')
       ORDER BY marcado_em ASC, id ASC
       `,
       [funcionario.id]
